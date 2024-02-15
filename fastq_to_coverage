@@ -1,0 +1,142 @@
+
+#!/usr/bin/bash
+
+# Quality Control on fastq files
+echo "### Starting the analysis of $run_name ###"
+echo "processing fastq files..."
+
+cd $dir
+
+# creating a list of all R1 fastq.gz
+ls -l *R1*fastq.gz | awk '{print $NF}' | grep -v Undetermined > fq_list
+
+mkdir fastQC
+mkdir Align
+
+# Doing Quality control on the samples and storing fastQC files in a folder
+
+cat fq_list | while read fq_sample
+do
+fastqc -q $fq_sample & # perform fastqc on R1
+fastqc -q ${fq_sample/R1/R2} & #perform fastqc on R2
+done
+
+
+# Waiting for all fastqc to finish
+pids=$(pgrep java | head -1)
+while [ ! -z "$pids" ]
+do
+        sleep 1
+        pids=$(pgrep java | head -1)
+done
+
+echo "fastqc complete. processing to Alignment"
+
+# Alignment using STAR
+cat fq_list | while read fq_sample
+do
+
+sample=$(echo $fq_sample | awk -F '_' '{print $1}')
+
+echo "Aligning sample $sample"
+
+STAR --genomeDir /data/ReferenceGenome/GRCm39_indices_STAR/   \
+--runThreadN 40 --readFilesIn $fq_sample ${fq_sample/R1/R2} --readFilesCommand zcat 		\
+--outSAMtype BAM SortedByCoordinate --outFileNamePrefix ./Align/${sample}/${sample}.
+
+done
+
+mv *fastqc* ./fastQC/
+rm fq_list
+
+# Changing directory and working with bamfiles
+
+cd ./Align/
+
+ls ./*/*.bam > samples
+tr ' ' '\n' < samples > sample_list
+
+mkdir COVERAGE
+cat sample_list | while read sample
+do
+sample_name=$(dirname ${sample/.\/})
+# Analysing coverage using samtools
+
+echo "Analysing Coverage: ${sample_name}"
+
+# Adding Read groups
+java -jar /usr/local/picard/picard.jar AddOrReplaceReadGroups \
+      I=${sample} \
+      O=./${sample_name}/${sample_name}_RG.bam \
+      RGID=${sample_name} \
+      RGLB=WGA \
+      RGPL=Illumina \
+      RGPU=Mouse \
+      RGSM=${sample_name} &
+done
+
+
+## waiting for AddorReplaceReadGroups to finish
+echo "waiting for picard to finish adding read groups name"
+pids=$(pgrep java | head -1)
+while [ ! -z "$pids" ]
+do
+sleep 1
+pids=$(pgrep java | head -1)
+done
+
+echo "### read group name added ###"
+
+cat sample_list | while read sample
+do
+sample_name=$(dirname ${sample/.\/})
+
+samtools index ./${sample_name}/${sample_name}_RG.bam &
+done
+
+# waiting for all indices to be created
+pids=$(pgrep samtools | head -1)
+while [ ! -z "$pids" ]
+do
+sleep 1
+pids=$(pgrep samtools | head -1)
+done
+
+
+# Calculating the coverage to determine the numbers of reads
+cat sample_list | while read sample
+do
+
+sample_name=$(dirname ${sample/.\/})
+
+samtools coverage ./${sample_name}/${sample_name}_RG.bam > ./COVERAGE/${sample_name}.tsv
+
+awk 'NR==1 {print $1 " " $4}' ./COVERAGE/${sample_name}.tsv > ./COVERAGE/tmp # getting only the chromosome name and reads count
+awk 'NR==FNR{a[$3]=$1; next} ($1 in a){print a[$1] " " $4}' /data/ReferenceGenome/GRCm39.UCSC2RefSeq.txt ./COVERAGE/${sample_name}.tsv >> ./COVERAGE/tmp
+mv ./COVERAGE/tmp ./COVERAGE/${sample_name}.tsv
+
+done
+
+rm samples
+
+cd ./COVERAGE/
+
+# Calling the R script to create the figures
+~/mouse_illumina.R
+
+# Organizing files
+
+rm Rplots.pdf
+
+day=$(date | awk '{print $NF $2 $3}')
+
+mv ReadCounts.csv ReadCounts.$run_name.${day}.csv
+mv CopyNumber.csv CopyNumber.$run_name.${day}.csv
+mkdir figures
+mv *png ./figures/
+
+cd ../../
+mv ./Align/COVERAGE/ .
+
+exec >/dev/tty
+echo "Files and figures should be ready to download"
